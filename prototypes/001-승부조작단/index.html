@@ -1,0 +1,316 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+<meta charset="UTF-8">
+<title>승부조작단 - 지하철 자리 쟁탈전</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { background: #111; display: flex; align-items: center; justify-content: center; min-height: 100vh; font-family: 'Courier New', monospace; }
+  .wrap { position: relative; display: inline-block; }
+  canvas { image-rendering: pixelated; cursor: crosshair; border: 2px solid #333; display: block; }
+  #retry { display: none; position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%); background: #1a1a2a; color: #ffee44; border: 2px solid #ffee44; padding: 8px 28px; font-family: 'Courier New', monospace; font-size: 16px; cursor: pointer; letter-spacing: 2px; }
+  #retry:hover { background: #2a2a3a; }
+</style>
+</head>
+<body>
+<div class="wrap">
+<canvas id="c"></canvas>
+<button id="retry">다시하기</button>
+</div>
+<script>
+// ── 밸런스 수치 ─────────────────────────────────────────
+const SCALE        = 3;
+const W            = 320;
+const H            = 180;
+const COUNTDOWN_MS = 1600;  // 카운트다운
+const WARNING_MS   = 500;   // 경고 구간
+const DOOR_ANIM_MS = 400;   // 문 열리는 애니메이션
+const WALK_MS      = 2200;  // 문까지 걷는 시간 (WARNING 시작 기준)
+const MISS_TIMEOUT = 2500;  // 자동 MISS
+const PERFECT_S    = 1300;  // 퍼펙트 구간 (문 열린 후 ms)
+const PERFECT_E    = 1800;
+const GOOD_S       = 800;   // GOOD 구간
+const GOOD_E       = 2300;
+// ────────────────────────────────────────────────────────
+
+const canvas = document.getElementById('c');
+canvas.width = W * SCALE;
+canvas.height = H * SCALE;
+const ctx = canvas.getContext('2d');
+ctx.scale(SCALE, SCALE);
+
+// ── 색상
+const C_BAK = '#cc3333', C_BAKL = '#ff6666';
+const C_MAN = '#aaaa00', C_MANL = '#ffee44';
+
+// ── 레이아웃
+const CW = 22, CH = 34;
+const BAK_X0 = 40,  BAK_Y0 = 78;
+const MAN_X0 = 258, MAN_Y0 = 78;
+const DL_X = 130, DL_W = 28;   // 왼쪽 문 패널
+const DR_X = 160, DR_W = 30;   // 오른쪽 문 패널
+const DOOR_Y = 48, DOOR_H = 82;
+const DOOR_OPEN_D = 30;
+const SEAT_X = 148;
+
+// 오른쪽 문 클릭 영역 (게임 좌표) — 문이 열렸을 때 포함
+const RD_ZONE = { x: 152, y: 42, w: 78, h: 94 };
+
+// ── 상태
+const S = { BRIEFING:0, COUNTDOWN:1, WARNING:2, DOOR_OPEN:3, RESULT:4 };
+let state, stateStart, doorOpenAt, walkStartAt, inputAt, grade, success, walkElapsedAtResult;
+
+const retryBtn = document.getElementById('retry');
+
+function enter(s) {
+  state = s;
+  stateStart = performance.now();
+  if (s === S.WARNING)   walkStartAt = stateStart;
+  if (s === S.DOOR_OPEN) doorOpenAt  = stateStart;
+  if (s === S.RESULT) setTimeout(() => { if (state === S.RESULT) retryBtn.style.display = 'block'; }, 1000);
+}
+function reset() {
+  retryBtn.style.display = 'none';
+  inputAt = null; grade = null; success = false; walkElapsedAtResult = 0;
+  enter(S.BRIEFING);
+}
+reset();
+retryBtn.addEventListener('click', reset);
+
+// ── 입력 처리 ────────────────────────────────────────────
+function onDoorClick(d) {
+  // d: 문 열린 후 경과 ms
+  inputAt = performance.now();
+  walkElapsedAtResult = WARNING_MS + d;
+  if      (d >= PERFECT_S && d <= PERFECT_E) { grade = 'PERFECT'; success = true; }
+  else if (d >= GOOD_S    && d <= GOOD_E)    { grade = 'GOOD';    success = true; }
+  else                                        { grade = 'BAD';     success = false; }
+  enter(S.RESULT);
+}
+
+canvas.addEventListener('click', e => {
+  if (retryBtn.style.display !== 'none') return;
+  const r = canvas.getBoundingClientRect();
+  const gx = (e.clientX - r.left) / SCALE;
+  const gy = (e.clientY - r.top)  / SCALE;
+  if (state === S.DOOR_OPEN) {
+    // 오른쪽 문 영역만 반응 — 클릭 위치가 핵심
+    if (gx >= RD_ZONE.x && gx <= RD_ZONE.x + RD_ZONE.w &&
+        gy >= RD_ZONE.y && gy <= RD_ZONE.y + RD_ZONE.h) {
+      onDoorClick(performance.now() - doorOpenAt);
+    }
+  } else if (state === S.BRIEFING) {
+    enter(S.COUNTDOWN);
+  }
+});
+
+// 스페이스: 의뢰서 스킵 / 재시작만
+document.addEventListener('keydown', e => {
+  if (e.code !== 'Space') return;
+  e.preventDefault();
+  if (retryBtn.style.display !== 'none') reset();
+  else if (state === S.BRIEFING) enter(S.COUNTDOWN);
+});
+
+// ── 드로잉 유틸 ──────────────────────────────────────────
+function fr(x, y, w, h, c) { ctx.fillStyle = c; ctx.fillRect(x, y, w, h); }
+function sk(x, y, w, h, c, lw=1) {
+  ctx.strokeStyle = c; ctx.lineWidth = lw;
+  ctx.strokeRect(x+lw/2, y+lw/2, w-lw, h-lw);
+}
+function tx(s, x, y, sz, c, a='left') {
+  ctx.fillStyle = c; ctx.font = `${sz}px 'Courier New'`;
+  ctx.textAlign = a; ctx.fillText(s, x, y); ctx.textAlign = 'left';
+}
+function lerp(a, b, t) { return a + (b-a) * Math.min(1, Math.max(0, t)); }
+function easeOut(t)    { t = Math.min(1, Math.max(0, t)); return 1-(1-t)*(1-t); }
+
+function drawChar(x, y, col, colL, label) {
+  fr(x, y, CW, CH, col);
+  sk(x, y, CW, CH, colL);
+  tx(label, x+CW/2, y+CH+11, 7, colL, 'center');
+}
+function drawFallen(cx, cy, col, colL, label, dir) {
+  ctx.save();
+  ctx.translate(cx+CW/2, cy+CH*0.65);
+  ctx.rotate(dir * Math.PI * 0.42);
+  ctx.fillStyle = col; ctx.fillRect(-CW/2, -CH/2, CW, CH);
+  ctx.strokeStyle = colL; ctx.lineWidth = 1; ctx.strokeRect(-CW/2+.5,-CH/2+.5,CW-1,CH-1);
+  ctx.restore();
+  tx(label, cx+CW/2, cy+CH+16, 7, colL, 'center');
+}
+function drawPsychic(x, y, prog) {
+  ctx.globalAlpha = Math.max(0, 1-prog);
+  const sz = 7 + prog*14;
+  tx('✦', x-sz*0.3, y+sz*0.3, sz, '#aaffff');
+  tx('✦', x+sz*0.1, y-sz*0.1, sz*0.5, '#ffffff');
+  ctx.globalAlpha = 1;
+}
+function drawBg() {
+  fr(0, 0, W, H, '#2a2a3a');
+  [10,80,180,250].forEach(wx => fr(wx, 8, 58, 28, '#1a2a4a'));
+  fr(0, 130, W, 50, '#3a2a2a');
+  for (let sx=10; sx<W-30; sx+=36) {
+    fr(sx, 100, 30, 30, sx===148 ? '#5a4a2a' : '#4a3a3a');
+    if (sx===148) sk(sx, 100, 30, 30, '#aa8833');
+  }
+  fr(0, 55, W, 2, '#555');
+  for (let hx=20; hx<W; hx+=30) { fr(hx,55,1,20,'#777'); fr(hx-4,73,10,5,'#777'); }
+}
+function drawDoor(leftOpen, rightOpen) {
+  const lx = DL_X - leftOpen * DOOR_OPEN_D;
+  const rx = DR_X + rightOpen * DOOR_OPEN_D;
+  fr(lx, DOOR_Y, DL_W, DOOR_H, '#445');
+  fr(rx, DOOR_Y, DR_W, DOOR_H, '#445');
+  sk(lx, DOOR_Y, DL_W, DOOR_H, '#667');
+  sk(rx, DOOR_Y, DR_W, DOOR_H, '#667');
+  if (leftOpen  < 0.5) fr(lx+DL_W-5, DOOR_Y+DOOR_H/2-5, 4, 10, '#888');
+  if (rightOpen < 0.5) fr(rx+1,       DOOR_Y+DOOR_H/2-5, 4, 10, '#888');
+}
+
+// WARNING 시작 기준 경과 시간으로 캐릭터 걷기 위치 계산
+function walkPos(elapsed) {
+  const t = Math.min(1, elapsed / WALK_MS);
+  return {
+    bak: lerp(BAK_X0, DL_X - CW, t),
+    man: lerp(MAN_X0, DR_X + DR_W + 2, t),
+  };
+}
+
+// ── 메인 루프 ─────────────────────────────────────────────
+function loop(now) {
+  requestAnimationFrame(loop);
+  const elapsed = now - stateStart;
+  ctx.clearRect(0, 0, W, H);
+  drawBg();
+
+  if (state === S.BRIEFING) {
+    fr(30, 18, 260, 144, '#1a1a2a');
+    sk(30, 18, 260, 144, '#aa8833', 2);
+    tx('[ 의 뢰 서 ]', W/2, 40, 10, '#aa8833', 'center');
+    tx('의뢰인: 박씨 아줌마 (45세)', 44, 60, 7, '#ccccaa');
+    tx('내  용: 퇴근길 창가 자리 확보', 44, 74, 7, '#ccccaa');
+    tx('       옆자리 아저씨 차단 요망', 44, 86, 7, '#ccccaa');
+    tx('보  수: 3,500원', 44, 102, 7, '#ccccaa');
+    tx('난이도: ⚡ 일상', 44, 116, 7, '#ccccaa');
+    tx('기  술: 염력', 44, 131, 7, '#88ccff');
+    tx('클릭으로 시작', W/2, 153, 7, '#666', 'center');
+    return;
+  }
+
+  if (state === S.COUNTDOWN || state === S.WARNING) {
+    drawDoor(0, 0);
+    if (state === S.COUNTDOWN) {
+      drawChar(BAK_X0, BAK_Y0, C_BAK, C_BAKL, '박씨');
+      drawChar(MAN_X0, MAN_Y0, C_MAN, C_MANL, '아저씨');
+    }
+    if (state === S.COUNTDOWN) {
+      const phase = Math.min(3, Math.floor(elapsed / (COUNTDOWN_MS/4)));
+      tx(['띵동...','다음 역은','홍대입구역','입니다.'][phase], W/2, 30, 9, '#cccc88', 'center');
+    } else {
+      const flash = Math.floor(elapsed/110) % 2 === 0;
+      if (flash) { fr(130,DOOR_Y,60,DOOR_H,'#55668a'); fr(130,DOOR_Y,28,DOOR_H,'#6677bb'); fr(160,DOOR_Y,30,DOOR_H,'#6677bb'); }
+      tx('문이 열립니다!', W/2, 30, 9, '#ffdd44', 'center');
+      // WARNING부터 걷기 시작 — 멈춤 없이 연속 진행
+      const wPos = walkPos(elapsed);
+      drawChar(wPos.bak, BAK_Y0, C_BAK, C_BAKL, '박씨');
+      drawChar(wPos.man, MAN_Y0, C_MAN, C_MANL, '아저씨');
+    }
+    if (state === S.COUNTDOWN && elapsed >= COUNTDOWN_MS) enter(S.WARNING);
+    if (state === S.WARNING   && elapsed >= WARNING_MS)   enter(S.DOOR_OPEN);
+    return;
+  }
+
+  if (state === S.DOOR_OPEN) {
+    const de = now - doorOpenAt;
+    const doorT = Math.min(de / DOOR_ANIM_MS, 1);
+    drawDoor(doorT, doorT);
+    const pos = walkPos(WARNING_MS + de);  // WARNING부터 누적 걷기 시간
+    drawChar(pos.bak, BAK_Y0, C_BAK, C_BAKL, '박씨');
+    drawChar(pos.man, MAN_Y0, C_MAN, C_MANL, '아저씨');
+    if (!inputAt && de > MISS_TIMEOUT) {
+      walkElapsedAtResult = WARNING_MS + MISS_TIMEOUT;
+      grade = 'MISS'; success = false; enter(S.RESULT);
+    }
+    return;
+  }
+
+  if (state === S.RESULT) {
+    const t = elapsed;
+    const p = walkPos(walkElapsedAtResult);  // 입력 시점의 캐릭터 위치
+
+    if (success) {
+      const isPerfect = grade === 'PERFECT';
+      // 오른쪽 문: 빠르게 닫힘 (염력)
+      const closeSpeed = isPerfect ? 220 : 380;
+      const rightT = Math.max(0, 1 - t / closeSpeed);
+      drawDoor(1, rightT);
+
+      // 염력 이펙트
+      if (t < 700) drawPsychic(DR_X + DR_W/2 + 8, DOOR_Y + 18, t / 700);
+
+      // 아저씨 반응: 계속 걸어오다 문에 맞음
+      const manApproachX = lerp(p.man, DR_X + 4, easeOut(Math.min(t / 500, 1)));
+      if (isPerfect && t > 420) {
+        // 넘어짐
+        drawFallen(manApproachX - 8, MAN_Y0 + 4, C_MAN, C_MANL, '아저씨', 1);
+        if (t > 450 && t < 900) tx('쾅!', DR_X + DR_W/2, DOOR_Y - 6, 10, '#ffee44', 'center');
+      } else {
+        // 걸어오다 멈추거나 흔들림 (GOOD)
+        const shake = (!isPerfect && t > 350 && t < 750) ? Math.sin(t / 40) * 3 : 0;
+        drawChar(manApproachX + shake, MAN_Y0, C_MAN, C_MANL, '아저씨');
+      }
+
+      // 박씨: 천천히 자리로
+      const bakDelay = 400;
+      const bakX = lerp(p.bak, SEAT_X - 4, easeOut(Math.max(0, t - bakDelay) / 1600));
+      drawChar(bakX, BAK_Y0, C_BAK, C_BAKL, '박씨');
+
+      _resultOverlay(t, isPerfect ? 600 : 700);
+
+    } else {
+      // BAD: 오른쪽 문이 잠깐 닫혔다가 열림 (눌렀으나 타이밍이 틀림)
+      // MISS: 문 그냥 열린 채로
+      if (grade === 'BAD') {
+        const rightT = t < 220 ? Math.max(0, 1 - t / 220) : Math.min(1, (t - 220) / 350);
+        drawDoor(1, rightT);
+      } else {
+        drawDoor(1, 1);
+      }
+
+      // 아저씨: 문을 통과해 박씨를 밀치며 전진
+      const manX = lerp(p.man, SEAT_X + CW/2, easeOut(Math.min(t / 900, 1)));
+      drawChar(manX, MAN_Y0, C_MAN, C_MANL, '아저씨');
+
+      // 박씨: 걷다가 밀려서 넘어짐
+      const PUSH_T = 520;
+      if (t < PUSH_T) {
+        const bakX = lerp(p.bak, p.bak + 18, easeOut(t / PUSH_T));
+        drawChar(bakX, BAK_Y0, C_BAK, C_BAKL, '박씨');
+      } else {
+        drawFallen(p.bak + 10, BAK_Y0 + 4, C_BAK, C_BAKL, '박씨', -1);
+        if (t > PUSH_T && t < PUSH_T + 350) tx('쿵!', p.bak + 22, DOOR_Y - 2, 10, '#ff6644', 'center');
+      }
+
+      _resultOverlay(t, 650);
+    }
+    return;
+  }
+}
+
+function _resultOverlay(t, delay) {
+  if (t < delay) return;
+  const colors = { PERFECT:'#ffee44', GOOD:'#88ff88', BAD:'#ff7733', MISS:'#cc4444' };
+  tx(grade, W/2, 52, 16, colors[grade], 'center');
+  tx(
+    success ? '성공!  +3,500원' : '실패...  위약금 -500원',
+    W/2, 158, 8,
+    success ? '#88ff88' : '#ff6655',
+    'center'
+  );
+}
+
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
