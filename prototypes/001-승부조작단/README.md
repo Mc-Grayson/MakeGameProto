@@ -26,6 +26,7 @@
 
 ## 기획 문서
 
-- [CONCEPT.md](CONCEPT.md) — 게임 컨셉 & 세계관
-- [MINIGAME_01_SUBWAY.md](MINIGAME_01_SUBWAY.md) — 지하철 미니게임 상세 기획
+- [GDD.md](GDD.md) — 통합 게임 기획서 (세계관, 공통 문법, 스테이지 아이디어, 상세 기획)
 - [TECH_STACK.md](TECH_STACK.md) — 기술 스택 분석 (Godot 이식 시 참고)
+- [legacy/](legacy/) — 과거 기획서 아카이브 (이전 파편화 문서)
+

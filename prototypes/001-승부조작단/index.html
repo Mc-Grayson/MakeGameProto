@@ -4,18 +4,23 @@
 <meta charset="UTF-8">
 <title>승부조작단 - 지하철 자리 쟁탈전</title>
 <style>
+  @import url('https://cdn.jsdelivr.net/gh/projectnoonnu/noonfonts_six@1.2/DungGeunMo.woff');
   * { margin: 0; padding: 0; box-sizing: border-box; }
-  body { background: #111; display: flex; align-items: center; justify-content: center; min-height: 100vh; font-family: 'Courier New', monospace; }
+  body { background: #111; display: flex; align-items: center; justify-content: center; min-height: 100vh; font-family: 'DungGeunMo', 'Courier New', monospace; }
   .wrap { position: relative; display: inline-block; }
   canvas { image-rendering: pixelated; cursor: crosshair; border: 2px solid #333; display: block; }
-  #retry { display: none; position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%); background: #1a1a2a; color: #ffee44; border: 2px solid #ffee44; padding: 8px 28px; font-family: 'Courier New', monospace; font-size: 16px; cursor: pointer; letter-spacing: 2px; }
-  #retry:hover { background: #2a2a3a; }
+  .btn { background: #1a1a2a; color: #ffee44; border: 2px solid #ffee44; padding: 8px 28px; font-family: 'DungGeunMo', 'Courier New', monospace; font-size: 16px; cursor: pointer; letter-spacing: 2px; }
+  .btn:hover { background: #2a2a3a; }
+  #ui-buttons { display: none; position: absolute; bottom: 28px; left: 50%; transform: translateX(-50%); gap: 12px; }
 </style>
 </head>
 <body>
 <div class="wrap">
 <canvas id="c"></canvas>
-<button id="retry">다시하기</button>
+<div id="ui-buttons">
+  <button id="retry" class="btn">다시하기</button>
+  <button id="lobby-btn" class="btn">의뢰목록</button>
+</div>
 </div>
 <script>
 // ── 밸런스 수치 ─────────────────────────────────────────
@@ -26,11 +31,20 @@ const COUNTDOWN_MS = 1600;  // 카운트다운
 const WARNING_MS   = 500;   // 경고 구간
 const DOOR_ANIM_MS = 400;   // 문 열리는 애니메이션
 const WALK_MS      = 2200;  // 문까지 걷는 시간 (WARNING 시작 기준)
-const MISS_TIMEOUT = 2500;  // 자동 MISS
-const PERFECT_S    = 1300;  // 퍼펙트 구간 (문 열린 후 ms)
-const PERFECT_E    = 1800;
-const GOOD_S       = 800;   // GOOD 구간
-const GOOD_E       = 2300;
+const MISS_TIMEOUT = 2600;  // 자동 MISS
+const PERFECT_S    = 1700;  // 퍼펙트 구간 (문 열린 후 ms)
+const PERFECT_E    = 1950;
+const GOOD_S       = 1700;  // GOOD 구간 (아저씨 완전히 멈춘 기준)
+const GOOD_E       = 2200;  // GOOD 종료 (파랑을 넘어뜨리기 전)
+// 2스테이지 오프닝/입력 타이밍 (phase1Start 기준 ms)
+// 시퀀스: t=-500 1번 출발 → t=0 2번 출발 → t=500 3번 출발(입력 윈도우 시작)
+//        → t=1000 3번 도착(입력 종료) → t=1500 김대리 출발 → t=2000 6번 진입
+const S2_STEP_MS         = 500;    // 차 한 대가 한 칸 이동하는 시간 (= 출발 간격)
+const S2_INPUT_START_MS  = 500;    // 입력 윈도우 시작 (= 3번이 2번 자리로 출발)
+const S2_INPUT_END_MS    = 1000;   // 입력 윈도우 종료 (= 3번이 2번 자리 도착)
+const S2_PERFECT_S_MS    = 700;    // PERFECT 시작
+const S2_PERFECT_E_MS    = 800;    // PERFECT 종료
+const S2_GREEN_SPEED     = 0.126;  // 초록차 위쪽 이동 속도 (Y/ms)
 // ────────────────────────────────────────────────────────
 
 const canvas = document.getElementById('c');
@@ -39,9 +53,11 @@ canvas.height = H * SCALE;
 const ctx = canvas.getContext('2d');
 ctx.scale(SCALE, SCALE);
 
-// ── 색상
-const C_BAK = '#cc3333', C_BAKL = '#ff6666';
-const C_MAN = '#aaaa00', C_MANL = '#ffee44';
+// ── 색상 (통합 기획서 기준: 아군=파랑/하늘, 적군=빨강/분홍)
+const C_BAK = '#2a66cc', C_BAKL = '#5c99ff'; // 박씨 아줌마 (아군)
+const C_MAN = '#cc2a2a', C_MANL = '#ff5c5c'; // 경쟁자 아저씨 (적군)
+const C_GREEN = '#33dd55', C_GREENL = '#aaff88'; // 초록차 (염력 타겟)
+const PERFECT_BONUS = 1000; // PERFECT 정밀 타이밍 보너스
 
 // ── 레이아웃
 const CW = 22, CH = 34;
@@ -56,60 +72,532 @@ const SEAT_X = 148;
 // 오른쪽 문 클릭 영역 (게임 좌표) — 문이 열렸을 때 포함
 const RD_ZONE = { x: 152, y: 42, w: 78, h: 94 };
 
+// 2스테이지 앞차(초록색 차량) 클릭 영역 (게임 좌표)
+const CAR_ZONE = { x: 135, y: 15, w: 48, h: 55 };
+
+// ── Web Audio API 8비트 사운드 시스템 ───────────────────────
+let audioCtx = null;
+let rumbleOsc = null;
+let rumbleGain = null;
+
+function initAudio() {
+  if (audioCtx) return;
+  audioCtx = new (window.AudioContext || window.webkitAudioContext)();
+}
+
+function playTone(freq, type, duration, vol, delay = 0) {
+  if (!audioCtx) return;
+  setTimeout(() => {
+    try {
+      const osc = audioCtx.createOscillator();
+      const gain = audioCtx.createGain();
+      osc.type = type;
+      osc.frequency.setValueAtTime(freq, audioCtx.currentTime);
+      gain.gain.setValueAtTime(vol, audioCtx.currentTime);
+      gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + duration);
+      osc.connect(gain);
+      gain.connect(audioCtx.destination);
+      osc.start();
+      osc.stop(audioCtx.currentTime + duration);
+    } catch (e) {
+      console.error(e);
+    }
+  }, delay * 1000);
+}
+
+function startSubwayRumble() {
+  if (!audioCtx) return;
+  try {
+    stopSubwayRumble();
+    rumbleOsc = audioCtx.createOscillator();
+    rumbleGain = audioCtx.createGain();
+    rumbleOsc.type = 'sine';
+    rumbleOsc.frequency.value = 55; // 55Hz 저음
+    rumbleGain.gain.value = 0.05;
+    
+    // 진동 변조용 LFO
+    const lfo = audioCtx.createOscillator();
+    const lfoGain = audioCtx.createGain();
+    lfo.frequency.value = 8; // 8Hz
+    lfoGain.gain.value = 15;
+    
+    lfo.connect(lfoGain);
+    lfoGain.connect(rumbleOsc.frequency);
+    
+    rumbleOsc.connect(rumbleGain);
+    rumbleGain.connect(audioCtx.destination);
+    
+    lfo.start();
+    rumbleOsc.start();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function stopSubwayRumble() {
+  if (rumbleOsc) {
+    try { rumbleOsc.stop(); } catch(e){}
+    rumbleOsc = null;
+  }
+}
+
+function playDingDong(phase) {
+  if (!audioCtx) return;
+  if (phase === 0) {
+    // E5 (659.25Hz) -> C5 (523.25Hz) 띵동
+    playTone(659.25, 'triangle', 0.25, 0.06, 0);
+    playTone(523.25, 'triangle', 0.35, 0.06, 0.2);
+  } else if (phase === 3) {
+    playTone(523.25, 'triangle', 0.12, 0.05, 0);
+  } else {
+    playTone(440.00, 'triangle', 0.08, 0.04, 0);
+  }
+}
+
+function playWarningBeep() {
+  if (!audioCtx) return;
+  // 문 열림 예고 경고음
+  playTone(880.00, 'square', 0.08, 0.03, 0);
+  playTone(880.00, 'square', 0.08, 0.03, 0.2);
+}
+
+function playDoorOpenSound() {
+  if (!audioCtx) return;
+  try {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sawtooth';
+    osc.frequency.setValueAtTime(600, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(80, audioCtx.currentTime + 0.4);
+    gain.gain.setValueAtTime(0.04, audioCtx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.0001, audioCtx.currentTime + 0.4);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.4);
+  } catch (e) {}
+}
+
+function playPsychicSound() {
+  if (!audioCtx) return;
+  try {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(200, audioCtx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(1800, audioCtx.currentTime + 0.3);
+    gain.gain.setValueAtTime(0.08, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.3);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.3);
+  } catch (e) {}
+}
+
+function playCrashSound() {
+  if (!audioCtx) return;
+  try {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'triangle';
+    osc.frequency.setValueAtTime(100, audioCtx.currentTime);
+    osc.frequency.linearRampToValueAtTime(20, audioCtx.currentTime + 0.4);
+    gain.gain.setValueAtTime(0.18, audioCtx.currentTime);
+    gain.gain.linearRampToValueAtTime(0.0001, audioCtx.currentTime + 0.4);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.4);
+  } catch (e) {}
+}
+
+function playSuccessFanfare() {
+  const now = 0;
+  playTone(523.25, 'triangle', 0.15, 0.06, now);
+  playTone(659.25, 'triangle', 0.15, 0.06, now + 0.12);
+  playTone(783.99, 'triangle', 0.15, 0.06, now + 0.24);
+  playTone(1046.50, 'triangle', 0.35, 0.08, now + 0.36);
+}
+
+function playFailMelody() {
+  const now = 0;
+  playTone(220.00, 'sawtooth', 0.2, 0.06, now);
+  playTone(174.61, 'sawtooth', 0.4, 0.06, now + 0.18);
+}
+
+// ── 2스테이지 자동차 주행/급정거/경적음 사운드 ──────────────────
+let engineOsc = null;
+let engineGain = null;
+
+function startCarEngineSound() {
+  if (!audioCtx) return;
+  try {
+    stopCarEngineSound();
+    engineOsc = audioCtx.createOscillator();
+    engineGain = audioCtx.createGain();
+    engineOsc.type = 'triangle';
+    engineOsc.frequency.value = 65; // 65Hz 저음 엔진음
+    engineGain.gain.value = 0.08;
+    
+    // 엔진 회전 질감용 LFO
+    const lfo = audioCtx.createOscillator();
+    const lfoGain = audioCtx.createGain();
+    lfo.frequency.value = 12; // 12Hz 진동
+    lfoGain.gain.value = 8;
+    
+    lfo.connect(lfoGain);
+    lfoGain.connect(engineOsc.frequency);
+    
+    engineOsc.connect(engineGain);
+    engineGain.connect(audioCtx.destination);
+    
+    lfo.start();
+    engineOsc.start();
+  } catch (e) {
+    console.error(e);
+  }
+}
+
+function stopCarEngineSound() {
+  if (engineOsc) {
+    try { engineOsc.stop(); } catch(e){}
+    engineOsc = null;
+  }
+}
+
+function playBrakeSqueal() {
+  if (!audioCtx) return;
+  try {
+    const osc = audioCtx.createOscillator();
+    const gain = audioCtx.createGain();
+    osc.type = 'sine';
+    osc.frequency.setValueAtTime(2200, audioCtx.currentTime);
+    osc.frequency.linearRampToValueAtTime(1800, audioCtx.currentTime + 0.35);
+    gain.gain.setValueAtTime(0.04, audioCtx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.35);
+    osc.connect(gain);
+    gain.connect(audioCtx.destination);
+    osc.start();
+    osc.stop(audioCtx.currentTime + 0.35);
+  } catch (e) {}
+}
+
+function playHornSound() {
+  if (!audioCtx) return;
+  try {
+    const horn = (delay) => {
+      setTimeout(() => {
+        if (!audioCtx) return;
+        const osc1 = audioCtx.createOscillator();
+        const osc2 = audioCtx.createOscillator();
+        const gain = audioCtx.createGain();
+        osc1.type = 'triangle';
+        osc2.type = 'triangle';
+        osc1.frequency.value = 440;
+        osc2.frequency.value = 554; // 장3도 화음으로 리얼리티 부여
+        
+        gain.gain.setValueAtTime(0.06, audioCtx.currentTime);
+        gain.gain.exponentialRampToValueAtTime(0.0001, audioCtx.currentTime + 0.15);
+        
+        osc1.connect(gain);
+        osc2.connect(gain);
+        gain.connect(audioCtx.destination);
+        
+        osc1.start();
+        osc2.start();
+        osc1.stop(audioCtx.currentTime + 0.15);
+        osc2.stop(audioCtx.currentTime + 0.15);
+      }, delay * 1000);
+    };
+    horn(0);
+    horn(0.2);
+  } catch (e) {}
+}
+
+// ── 2스테이지 상태 및 차량 생성 ───────────────────────
+let stage2Phase = 0; // 0: 카운트다운/워닝, 1: 오프닝 진행 + 입력, 2: 결과
+let phase0Start = 0;
+let phase1Start = 0;
+let clickGreenY = 0; // 클릭 시점의 초록차 Y 좌표
+
+// 위에서부터 1, 2, 3, 김대리(4), 5, 6번 차량 정의
+const STAGE2_CARS = [
+  { id: 'car1', col: '#777777', colL: '#aaaaaa', label: 'SUV' },
+  { id: 'car2', col: '#ddaa22', colL: '#ffdd55', label: '택시' },
+  { id: 'car3', col: '#dd6622', colL: '#ff8855', label: '스포츠카' },
+  { id: 'kim',  col: '#2a66cc', colL: '#5c99ff', label: '김대리' },
+  { id: 'car5', col: '#dd55aa', colL: '#ff88cc', label: '쿠페' },
+  { id: 'car6', col: '#55aadd', colL: '#88ddff', label: '승용차' }
+];
+
+function initStage2Vehicles() {
+  stage2Phase = 0;
+  phase0Start = performance.now();
+  phase1Start = 0;
+  clickGreenY = 0;
+}
+
+// ── 스테이지 및 보수 관리
+let currentStage = 0; // 0: 로비, 1: 지하철, 2: 자동차
+let stageClears = [false, false];
+let totalEarned = 0;
+
 // ── 상태
 const S = { BRIEFING:0, COUNTDOWN:1, WARNING:2, DOOR_OPEN:3, RESULT:4 };
 let state, stateStart, doorOpenAt, walkStartAt, inputAt, grade, success, walkElapsedAtResult;
+let lastCountdownPhase = -1;
 
+const uiButtons = document.getElementById('ui-buttons');
 const retryBtn = document.getElementById('retry');
+const lobbyBtn = document.getElementById('lobby-btn');
 
 function enter(s) {
   state = s;
   stateStart = performance.now();
-  if (s === S.WARNING)   walkStartAt = stateStart;
-  if (s === S.DOOR_OPEN) doorOpenAt  = stateStart;
-  if (s === S.RESULT) setTimeout(() => { if (state === S.RESULT) retryBtn.style.display = 'block'; }, 1000);
+  if (s === S.COUNTDOWN) {
+    initAudio();
+    if (currentStage === 1) startSubwayRumble();
+    else if (currentStage === 2) startCarEngineSound();
+  }
+  if (s === S.WARNING) {
+    walkStartAt = stateStart;
+    playWarningBeep();
+  }
+  if (s === S.DOOR_OPEN) {
+    doorOpenAt  = stateStart;
+    playDoorOpenSound();
+    if (currentStage === 2) {
+      stage2Phase = 1;
+      phase1Start = stateStart;
+    }
+  }
+  if (s === S.RESULT) {
+    if (currentStage === 1) stopSubwayRumble();
+    else if (currentStage === 2) stopCarEngineSound();
+    
+    // 스테이지별 성공 보수 정산
+    if (success) {
+      if (currentStage === 1 && !stageClears[0]) {
+        stageClears[0] = true;
+        totalEarned += 3500;
+      } else if (currentStage === 2 && !stageClears[1]) {
+        stageClears[1] = true;
+        totalEarned += 4500 + (grade === 'PERFECT' ? PERFECT_BONUS : 0);
+      }
+    } else {
+      totalEarned = Math.max(0, totalEarned - 500); // 실패 시 위약금 -500원
+    }
+
+    if (currentStage === 1) {
+      if (success) {
+        setTimeout(playCrashSound, 200); // 쾅! 충돌 시점 (200ms)
+        setTimeout(playSuccessFanfare, 1200); // 성공 멜로디 (1200ms)
+        setTimeout(() => { if (state === S.RESULT) uiButtons.style.display = 'flex'; }, 2000);
+      } else {
+        if (grade === 'BAD') {
+          setTimeout(playCrashSound, 1800); // 밀쳐 넘어뜨리는 시점 (1800ms)
+          setTimeout(playFailMelody, 2000); // 실패 멜로디 (2000ms)
+          setTimeout(() => { if (state === S.RESULT) uiButtons.style.display = 'flex'; }, 3200);
+        } else {
+          setTimeout(playCrashSound, 800); // 밀쳐 넘어뜨리는 시점 (800ms)
+          setTimeout(playFailMelody, 1000); // 실패 멜로디 (1000ms)
+          setTimeout(() => { if (state === S.RESULT) uiButtons.style.display = 'flex'; }, 2500);
+        }
+      }
+    } else if (currentStage === 2) {
+      if (success) {
+        playBrakeSqueal(); // 염력 급브레이크 (즉시)
+        setTimeout(playHornSound, 800); // 막힌 얌체의 분노 경적
+        setTimeout(playSuccessFanfare, 1200);
+        setTimeout(() => { if (state === S.RESULT) uiButtons.style.display = 'flex'; }, 1900);
+      } else {
+        if (grade === 'BAD') {
+          // 너무 일찍 — 얌체차 회피
+          setTimeout(playHornSound, 900);
+          setTimeout(playFailMelody, 1500);
+          setTimeout(() => { if (state === S.RESULT) uiButtons.style.display = 'flex'; }, 2300);
+        } else {
+          // LATE — 김대리 충격
+          playCrashSound();
+          setTimeout(playHornSound, 500);
+          setTimeout(playFailMelody, 1300);
+          setTimeout(() => { if (state === S.RESULT) uiButtons.style.display = 'flex'; }, 2000);
+        }
+      }
+    }
+  }
 }
 function reset() {
-  retryBtn.style.display = 'none';
+  uiButtons.style.display = 'none';
   inputAt = null; grade = null; success = false; walkElapsedAtResult = 0;
-  enter(S.BRIEFING);
+  lastCountdownPhase = -1;
+  
+  if (currentStage === 0) {
+    // 로비 상태일 경우 특별 처리 없음
+  } else {
+    if (currentStage === 2) {
+      initStage2Vehicles();
+    }
+    enter(S.BRIEFING);
+  }
+}
+function goLobby() {
+  currentStage = 0;
+  reset();
 }
 reset();
 retryBtn.addEventListener('click', reset);
+lobbyBtn.addEventListener('click', goLobby);
 
 // ── 입력 처리 ────────────────────────────────────────────
 function onDoorClick(d) {
   // d: 문 열린 후 경과 ms
   inputAt = performance.now();
+  playPsychicSound(); // 염력 격발음 재생
   walkElapsedAtResult = WARNING_MS + d;
-  if      (d >= PERFECT_S && d <= PERFECT_E) { grade = 'PERFECT'; success = true; }
-  else if (d >= GOOD_S    && d <= GOOD_E)    { grade = 'GOOD';    success = true; }
-  else                                        { grade = 'BAD';     success = false; }
+  
+  if (d < GOOD_S) {
+    grade = 'BAD';
+    success = false;
+  } else if (d <= GOOD_E) {
+    if (d >= PERFECT_S && d <= PERFECT_E) {
+      grade = 'PERFECT';
+    } else {
+      grade = 'GOOD';
+    }
+    success = true;
+  } else {
+    grade = 'LATE';
+    success = false;
+  }
   enter(S.RESULT);
 }
 
-canvas.addEventListener('click', e => {
-  if (retryBtn.style.display !== 'none') return;
-  const r = canvas.getBoundingClientRect();
-  const gx = (e.clientX - r.left) / SCALE;
-  const gy = (e.clientY - r.top)  / SCALE;
-  if (state === S.DOOR_OPEN) {
-    // 오른쪽 문 영역만 반응 — 클릭 위치가 핵심
-    if (gx >= RD_ZONE.x && gx <= RD_ZONE.x + RD_ZONE.w &&
-        gy >= RD_ZONE.y && gy <= RD_ZONE.y + RD_ZONE.h) {
-      onDoorClick(performance.now() - doorOpenAt);
+function onCarClick(d, greenY) {
+  // d: phase1Start 후 경과 ms — 시간 기반 판정 (3번이 2번 자리로 이동하는 동안이 입력 윈도우)
+  inputAt = performance.now();
+  playPsychicSound(); // 염력 격발음 재생
+  walkElapsedAtResult = d;
+  clickGreenY = greenY;
+
+  if (greenY === 999) {
+    // 빗나간 클릭
+    grade = 'BAD';
+    success = false;
+  } else if (d < S2_INPUT_START_MS) {
+    // TOO EARLY — 3번이 아직 출발 안 함
+    grade = 'BAD';
+    success = false;
+  } else if (d <= S2_INPUT_END_MS) {
+    // GOOD/PERFECT — 3번이 자리2로 이동하는 동안
+    if (d >= S2_PERFECT_S_MS && d <= S2_PERFECT_E_MS) {
+      grade = 'PERFECT';
+    } else {
+      grade = 'GOOD';
     }
-  } else if (state === S.BRIEFING) {
-    enter(S.COUNTDOWN);
+    success = true;
+  } else {
+    // TOO LATE — 3번이 이미 자리2에 도착
+    grade = 'LATE';
+    success = false;
+  }
+
+  stage2Phase = 2; // 결과 연출 페이즈로 전환
+  enter(S.RESULT);
+}
+
+let mx = 0, my = 0;
+canvas.addEventListener('mousemove', e => {
+  const r = canvas.getBoundingClientRect();
+  mx = (e.clientX - r.left) / SCALE;
+  my = (e.clientY - r.top)  / SCALE;
+
+  if (currentStage === 0) {
+    const onBtn1 = (mx >= 40 && mx <= 280 && my >= 60 && my <= 96);
+    const onBtn2 = (mx >= 40 && mx <= 280 && my >= 108 && my <= 144);
+    if (onBtn1 || onBtn2) {
+      canvas.style.cursor = 'pointer';
+    } else {
+      canvas.style.cursor = 'default';
+    }
+  } else if (currentStage === 1) {
+    if (state === S.DOOR_OPEN && mx >= RD_ZONE.x && mx <= RD_ZONE.x + RD_ZONE.w && my >= RD_ZONE.y && my <= RD_ZONE.y + RD_ZONE.h) {
+      canvas.style.cursor = 'pointer';
+    } else if (state === S.BRIEFING) {
+      canvas.style.cursor = 'pointer';
+    } else {
+      canvas.style.cursor = 'default';
+    }
+  } else if (currentStage === 2) {
+    if (state === S.DOOR_OPEN && stage2Phase === 1 && checkClickedCar(mx, my)) {
+      canvas.style.cursor = 'pointer';
+    } else if (state === S.BRIEFING) {
+      canvas.style.cursor = 'pointer';
+    } else {
+      canvas.style.cursor = 'default';
+    }
+  } else {
+    canvas.style.cursor = 'default';
   }
 });
 
-// 스페이스: 의뢰서 스킵 / 재시작만
+canvas.addEventListener('click', e => {
+  if (uiButtons.style.display === 'flex') return;
+  const r = canvas.getBoundingClientRect();
+  const gx = (e.clientX - r.left) / SCALE;
+  const gy = (e.clientY - r.top)  / SCALE;
+
+  if (currentStage === 0) {
+    // 의뢰 1 클릭
+    if (gx >= 40 && gx <= 280 && gy >= 60 && gy <= 96) {
+      currentStage = 1;
+      enter(S.BRIEFING);
+    }
+    // 의뢰 2 클릭
+    else if (gx >= 40 && gx <= 280 && gy >= 108 && gy <= 144) {
+      currentStage = 2;
+      enter(S.BRIEFING);
+    }
+    return;
+  }
+
+  if (currentStage === 1) {
+    if (state === S.DOOR_OPEN) {
+      if (gx >= RD_ZONE.x && gx <= RD_ZONE.x + RD_ZONE.w &&
+          gy >= RD_ZONE.y && gy <= RD_ZONE.y + RD_ZONE.h) {
+        onDoorClick(performance.now() - doorOpenAt);
+      }
+    } else if (state === S.BRIEFING) {
+      enter(S.COUNTDOWN);
+    }
+  } else if (currentStage === 2) {
+    if (state === S.DOOR_OPEN) {
+      if (stage2Phase === 1) {
+        if (gx >= 40 && gx <= 280) {
+          const clickedCar = checkClickedCar(gx, gy);
+          const de = performance.now() - phase1Start;
+          const greenY = 200 - de * 0.08;
+          if (clickedCar) {
+            onCarClick(de, greenY);
+          } else {
+            // 도로 안쪽을 탭했으나 빗나감 -> BAD 처리
+            onCarClick(de, 999);
+          }
+        }
+      }
+    } else if (state === S.BRIEFING) {
+      enter(S.COUNTDOWN);
+    }
+  }
+});
+
+// 스페이스: 의뢰서 스킵 / 재시작
 document.addEventListener('keydown', e => {
   if (e.code !== 'Space') return;
   e.preventDefault();
-  if (retryBtn.style.display !== 'none') reset();
-  else if (state === S.BRIEFING) enter(S.COUNTDOWN);
+  if (uiButtons.style.display === 'flex') reset();
+  else if (currentStage > 0 && state === S.BRIEFING) enter(S.COUNTDOWN);
 });
 
 // ── 드로잉 유틸 ──────────────────────────────────────────
@@ -119,7 +607,7 @@ function sk(x, y, w, h, c, lw=1) {
   ctx.strokeRect(x+lw/2, y+lw/2, w-lw, h-lw);
 }
 function tx(s, x, y, sz, c, a='left') {
-  ctx.fillStyle = c; ctx.font = `${sz}px 'Courier New'`;
+  ctx.fillStyle = c; ctx.font = `${sz}px 'DungGeunMo', 'Courier New'`;
   ctx.textAlign = a; ctx.fillText(s, x, y); ctx.textAlign = 'left';
 }
 function lerp(a, b, t) { return a + (b-a) * Math.min(1, Math.max(0, t)); }
@@ -145,6 +633,21 @@ function drawPsychic(x, y, prog) {
   tx('✦', x-sz*0.3, y+sz*0.3, sz, '#aaffff');
   tx('✦', x+sz*0.1, y-sz*0.1, sz*0.5, '#ffffff');
   ctx.globalAlpha = 1;
+}
+// 초록차 클릭 단서 — 외곽 글로우 + ↓ 화살표
+function drawTargetHint(carX, carY, de) {
+  // 글로우 (펄스): 외곽선 두 겹
+  const pulse = 0.5 + 0.5 * Math.sin(performance.now() / 120);
+  ctx.globalAlpha = 0.4 + 0.4 * pulse;
+  ctx.strokeStyle = '#ffff66';
+  ctx.lineWidth = 1;
+  ctx.strokeRect(carX - 2.5, carY - 2.5, 15, 21);
+  ctx.globalAlpha = 1;
+  // ▼ 화살표 (차량 위, 깜빡임)
+  const blink = Math.floor(performance.now() / 200) % 2 === 0;
+  if (blink) {
+    tx('▼', carX + 5, carY - 4, 9, '#ffff66', 'center');
+  }
 }
 function drawBg() {
   fr(0, 0, W, H, '#2a2a3a');
@@ -177,137 +680,611 @@ function walkPos(elapsed) {
   };
 }
 
+// ── 2스테이지 차량 위치/클릭 헬퍼 ─────────────────────────────
+// 오프닝 진행 시각 t (phase1Start 기준; WARNING 시작은 t=-WARNING_MS)에서 N번 차의 Y
+function s2_carPos(N, t) {
+  // 6번 차: 화면 하단(Y=200)에서 자리5(Y=138)로 진입 (t=2000~2500)
+  if (N === 6) {
+    if (t < 2000) return null;
+    const tp = Math.min(1, (t - 2000) / S2_STEP_MS);
+    return lerp(200, 138, easeOut(tp));
+  }
+  // 1~5번 차: 각자 출발 시각에 한 칸씩 위로 이동
+  const t_start = -S2_STEP_MS + S2_STEP_MS * (N - 1);
+  const t_end = t_start + S2_STEP_MS;
+  const y_start = 10 + 32 * (N - 1);
+  const y_end = y_start - 32;
+  if (t < t_start) return y_start;
+  if (t >= t_end) {
+    if (N === 1) return null; // 화면 밖으로 사라짐
+    return y_end;
+  }
+  return lerp(y_start, y_end, easeOut((t - t_start) / S2_STEP_MS));
+}
+
+function getStage2CarPositions(elapsed, resultElapsed = 0) {
+  const cars = [];
+  if (currentStage !== 2) return cars;
+
+  // 오프닝 진행 시각 t (phase1Start 기준)
+  // phase 0: COUNTDOWN은 t=-500 (모두 정지), WARNING은 t=-500~0 (1번 출발)
+  let t;
+  if (stage2Phase === 0) {
+    t = (state === S.WARNING) ? (elapsed - WARNING_MS) : -WARNING_MS;
+  } else {
+    t = elapsed; // phase 1, 2 모두 phase1Start 기준
+  }
+
+  // LATE면 김대리/5번/6번은 정체 (얌체차에 자리3가 막혀 김대리 정지)
+  const isLate = (stage2Phase === 2 && !success && grade === 'LATE');
+
+  // 4차로 차량 1~6번
+  for (let N = 1; N <= 6; N++) {
+    const def = STAGE2_CARS[N - 1];
+    let y;
+    if (isLate && (N === 4 || N === 5)) {
+      y = 10 + 32 * (N - 1); // 원래 자리에 정지
+    } else if (isLate && N === 6) {
+      continue; // 등장 안 함
+    } else {
+      y = s2_carPos(N, t);
+    }
+    if (y === null || y === undefined) continue;
+    cars.push({
+      id: def.id, x: 245, y, w: 10, h: 16,
+      col: def.col, colL: def.colL, label: def.label
+    });
+  }
+
+  // 1·2차로 배경 차량 (도로가 살아있는 느낌)
+  const tnow = performance.now();
+  const lane2y = ((tnow * 0.12) % 220) - 30;
+  if (lane2y > -25 && lane2y < 200) {
+    cars.push({ id: 'bg2', x: 125, y: lane2y, w: 10, h: 16, col: '#999988', colL: '#ccccaa', label: '' });
+  }
+  const lane1y = ((tnow * 0.16 + 80) % 240) - 30;
+  if (lane1y > -25 && lane1y < 200) {
+    cars.push({ id: 'bg1', x: 65, y: lane1y, w: 10, h: 16, col: '#776655', colL: '#aa9988', label: '' });
+  }
+
+  // 옆 차선(3차로) 초록차 + 얌체차
+  if (stage2Phase === 1) {
+    const greenY = 200 - elapsed * S2_GREEN_SPEED;
+    if (greenY > -25 && greenY < 200) {
+      cars.push({ id: 'green', x: 185, y: greenY, w: 10, h: 16, col: C_GREEN, colL: C_GREENL, label: '초록차', isTarget: true });
+    }
+    const redY = greenY + 28;
+    if (redY > -25 && redY < 200) {
+      cars.push({ id: 'red', x: 185, y: redY, w: 10, h: 16, col: '#cc2a2a', colL: '#ff5c5c', label: '얌체차', warningFlash: true });
+    }
+  } else if (stage2Phase === 2) {
+    const tr = resultElapsed;
+
+    if (success) {
+      // 성공 — 초록차 급제동 후 정지, 얌체차 그 뒤에 막힘
+      const slideStop = Math.min(8, tr * 0.04);
+      const gY = clickGreenY - slideStop;
+      cars.push({ id: 'green', x: 185, y: gY, w: 10, h: 16, col: C_GREEN, colL: C_GREENL, label: '초록차' });
+      const shake = tr > 400 ? Math.sin(tr / 80) * 0.6 : 0;
+      cars.push({ id: 'red', x: 185 + shake, y: clickGreenY + 28, w: 10, h: 16, col: '#cc2a2a', colL: '#ff5c5c', label: '얌체차', warningFlash: true });
+
+    } else if (grade === 'BAD') {
+      // 너무 일찍 — 얌체차가 눈치 채고 옆 차선으로 회피
+      cars.push({ id: 'green', x: 185, y: clickGreenY, w: 10, h: 16, col: C_GREEN, colL: C_GREENL, label: '초록차' });
+
+      let rx = 185, ry = clickGreenY + 28, rAngle = 0;
+      if (tr < 400) {
+        rx = lerp(185, 125, tr / 400);
+        ry = (clickGreenY + 28) - tr * 0.08;
+        rAngle = lerp(0, -0.4, tr / 400);
+      } else if (tr < 1000) {
+        rx = 125;
+        ry = lerp(clickGreenY + 28 - 32, 58, (tr - 400) / 600);
+      } else if (tr < 1500) {
+        rx = lerp(125, 245, (tr - 1000) / 500);
+        ry = 58;
+        rAngle = lerp(0, 0.4, (tr - 1000) / 500);
+      } else {
+        rx = 245; ry = 58;
+      }
+      cars.push({ id: 'red', x: rx, y: ry, w: 10, h: 16, col: '#cc2a2a', colL: '#ff5c5c', label: '얌체차', angle: rAngle });
+
+    } else {
+      // LATE — 얌체차가 자리3(Y=74, 김대리 앞)에 끼어듦
+      const gy = clickGreenY - tr * 0.08;
+      if (gy > -25) {
+        cars.push({ id: 'green', x: 185, y: gy, w: 10, h: 16, col: C_GREEN, colL: C_GREENL, label: '초록차' });
+      }
+      const ry_start = clickGreenY + 28;
+      let rx = 185, ry = ry_start, rAngle = 0;
+      if (tr < 400) {
+        rx = 185;
+        ry = lerp(ry_start, 74, tr / 400);
+      } else if (tr < 800) {
+        const tMerge = (tr - 400) / 400;
+        rx = lerp(185, 245, tMerge);
+        ry = 74;
+        rAngle = Math.sin(tMerge * Math.PI) * 0.35;
+      } else {
+        rx = 245; ry = 74; rAngle = 0;
+      }
+      cars.push({ id: 'red', x: rx, y: ry, w: 10, h: 16, col: '#cc2a2a', colL: '#ff5c5c', label: '얌체차', angle: rAngle });
+    }
+  }
+
+  return cars;
+}
+
+function checkClickedCar(gx, gy) {
+  if (state !== S.DOOR_OPEN || stage2Phase !== 1) return null;
+  const de = performance.now() - phase1Start;
+  const cars = getStage2CarPositions(de);
+  const green = cars.find(c => c.id === 'green');
+  if (green) {
+    const padW = 6;
+    const padH = 6;
+    if (gx >= green.x - padW && gx <= green.x + 10 + padW &&
+        gy >= green.y - padH && gy <= green.y + 16 + padH) {
+      return green;
+    }
+  }
+  return null;
+}
+
+function drawVehicle(x, y, col, colL, label, angle = 0, warningFlash = false) {
+  ctx.save();
+  ctx.translate(x + 5, y + 8); // w=10, h=16 기준 중심점
+  ctx.rotate(angle);
+  
+  // 바퀴 4개 (검정)
+  ctx.fillStyle = '#111';
+  ctx.fillRect(-6, -6, 2, 3);
+  ctx.fillRect(4, -6, 2, 3);
+  ctx.fillRect(-6, 3, 2, 3);
+  ctx.fillRect(4, 3, 2, 3);
+  
+  // 차체
+  ctx.fillStyle = col;
+  ctx.fillRect(-5, -8, 10, 16);
+  
+  // 차체 테두리
+  ctx.strokeStyle = colL;
+  ctx.lineWidth = 1;
+  ctx.strokeRect(-4.5, -7.5, 9, 15);
+  
+  // 창문 (하늘색)
+  ctx.fillStyle = '#99ddff';
+  ctx.fillRect(-3, -4, 6, 2); // 앞창
+  ctx.fillRect(-3, 2, 6, 2);  // 뒷창
+  ctx.fillRect(-4, -1, 1, 2);  // 좌유리
+  ctx.fillRect(3, -1, 1, 2);   // 우유리
+  
+  // 헤드라이트 (노랑)
+  ctx.fillStyle = '#ffffaa';
+  ctx.fillRect(-4, -8, 2, 1);
+  ctx.fillRect(2, -8, 2, 1);
+  
+  // 방향지시등 (우측 깜빡이)
+  if (warningFlash) {
+    const flash = (Math.floor(performance.now() / 150) % 2 === 0);
+    ctx.fillStyle = flash ? '#ff9900' : '#442200';
+    ctx.fillRect(3, -7, 1, 1); // 앞
+    ctx.fillRect(3, 6, 1, 1);  // 뒤
+  }
+  
+  ctx.restore();
+  
+  // 라벨
+  tx(label, x + 5, y + 25, 7, colL, 'center');
+}
+
+function drawRoad(now, speed = 4) {
+  // 아스팔트
+  fr(40, 0, 240, H, '#2a2a2a');
+  
+  // 갓길
+  fr(37, 0, 3, H, '#ddddcc');
+  fr(280, 0, 3, H, '#ddddcc');
+  
+  // 차선 점선 (1차선과 2차선 사이 x=100, 2차선과 3차선 사이 x=160, 3차선과 4차선 사이 x=220)
+  const offset = (now * (speed / 16)) % 40;
+  ctx.strokeStyle = '#888877';
+  ctx.lineWidth = 1.5;
+  ctx.setLineDash([12, 18]);
+  ctx.lineDashOffset = -offset;
+  
+  ctx.beginPath();
+  ctx.moveTo(100, 0); ctx.lineTo(100, H);
+  ctx.moveTo(160, 0); ctx.lineTo(160, H);
+  ctx.moveTo(220, 0); ctx.lineTo(220, H);
+  ctx.stroke();
+  ctx.setLineDash([]);
+}
+
+function drawLobby() {
+  // 배경: 세련된 다크 퍼플
+  fr(0, 0, W, H, '#0f0f1b');
+  
+  // 대각선 스캔라인 패턴으로 도트 아케이드 느낌 부여
+  ctx.strokeStyle = '#171727';
+  ctx.lineWidth = 1;
+  for (let i = -H; i < W; i += 16) {
+    ctx.beginPath();
+    ctx.moveTo(i, 0);
+    ctx.lineTo(i + H, H);
+    ctx.stroke();
+  }
+  
+  // 장식용 테두리
+  sk(5, 5, W - 10, H - 10, '#3a3a5a', 1);
+  sk(7, 7, W - 14, H - 14, '#1a1a2a', 1);
+
+  // 타이틀
+  tx('★ 승부조작단 의뢰 목록 ★', W/2, 26, 12, '#ffee44', 'center');
+  
+  // 보유 자산 표시
+  fr(200, 36, 92, 16, '#17172a');
+  sk(200, 36, 92, 16, '#8888aa');
+  tx(`자산: ${totalEarned.toLocaleString()}원`, 205, 47, 7, '#ffee44');
+  
+  tx('원하는 해결사를 고르듯 의뢰를 클릭하세요.', W/2, 48, 7, '#7a7a9a', 'center');
+  
+  // 의뢰 1 버튼
+  const on1 = (mx >= 40 && mx <= 280 && my >= 60 && my <= 96);
+  fr(40, 60, 240, 34, on1 ? '#222238' : '#141424');
+  sk(40, 60, 240, 34, stageClears[0] ? '#66cc66' : (on1 ? '#ffee44' : '#665522'), 1.5);
+  tx('의뢰 1. 지하철 자리 쟁탈전', 50, 74, 8, '#ffee44');
+  tx(stageClears[0] ? '✔ 성공 - 보수 획득 완료 (3,500원)' : '■ 미달성 - 목표 보수: 3,500원', 50, 86, 7, stageClears[0] ? '#88ff88' : '#8888aa');
+  
+  // 의뢰 2 버튼
+  const on2 = (mx >= 40 && mx <= 280 && my >= 108 && my <= 144);
+  fr(40, 108, 240, 34, on2 ? '#222238' : '#141424');
+  sk(40, 108, 240, 34, stageClears[1] ? '#66cc66' : (on2 ? '#ffee44' : '#665522'), 1.5);
+  tx('의뢰 2. 얌체 끼어들기 차단', 50, 122, 8, '#ffee44');
+  tx(stageClears[1] ? '✔ 성공 - 보수 획득 완료 (4,500원)' : '■ 미달성 - 목표 보수: 4,500원', 50, 134, 7, stageClears[1] ? '#88ff88' : '#8888aa');
+}
+
 // ── 메인 루프 ─────────────────────────────────────────────
 function loop(now) {
   requestAnimationFrame(loop);
   const elapsed = now - stateStart;
   ctx.clearRect(0, 0, W, H);
-  drawBg();
 
-  if (state === S.BRIEFING) {
-    fr(30, 18, 260, 144, '#1a1a2a');
-    sk(30, 18, 260, 144, '#aa8833', 2);
-    tx('[ 의 뢰 서 ]', W/2, 40, 10, '#aa8833', 'center');
-    tx('의뢰인: 박씨 아줌마 (45세)', 44, 60, 7, '#ccccaa');
-    tx('내  용: 퇴근길 창가 자리 확보', 44, 74, 7, '#ccccaa');
-    tx('       옆자리 아저씨 차단 요망', 44, 86, 7, '#ccccaa');
-    tx('보  수: 3,500원', 44, 102, 7, '#ccccaa');
-    tx('난이도: ⚡ 일상', 44, 116, 7, '#ccccaa');
-    tx('기  술: 염력', 44, 131, 7, '#88ccff');
-    tx('클릭으로 시작', W/2, 153, 7, '#666', 'center');
+  // 1. 로비 단계
+  if (currentStage === 0) {
+    drawLobby();
     return;
   }
 
-  if (state === S.COUNTDOWN || state === S.WARNING) {
-    drawDoor(0, 0);
-    if (state === S.COUNTDOWN) {
-      drawChar(BAK_X0, BAK_Y0, C_BAK, C_BAKL, '박씨');
-      drawChar(MAN_X0, MAN_Y0, C_MAN, C_MANL, '아저씨');
+  // 2. 지하철 스테이지
+  if (currentStage === 1) {
+    drawBg();
+
+    if (state === S.BRIEFING) {
+      fr(30, 18, 260, 144, '#1a1a2a');
+      sk(30, 18, 260, 144, '#aa8833', 2);
+      tx('[ 의 뢰 서 ]', W/2, 40, 10, '#aa8833', 'center');
+      tx('의뢰인: 박씨 아줌마 (45세)', 44, 60, 7, '#ccccaa');
+      tx('내  용: 퇴근길 창가 자리 확보', 44, 74, 7, '#ccccaa');
+      tx('       옆자리 아저씨 차단 요망', 44, 86, 7, '#ccccaa');
+      tx('보  수: 3,500원', 44, 102, 7, '#ccccaa');
+      tx('난이도: ⚡ 일상', 44, 116, 7, '#ccccaa');
+      tx('기  술: 염력', 44, 131, 7, '#88ccff');
+      tx('클릭으로 시작', W/2, 153, 7, '#666', 'center');
+      return;
     }
-    if (state === S.COUNTDOWN) {
-      const phase = Math.min(3, Math.floor(elapsed / (COUNTDOWN_MS/4)));
-      tx(['띵동...','다음 역은','홍대입구역','입니다.'][phase], W/2, 30, 9, '#cccc88', 'center');
-    } else {
-      const flash = Math.floor(elapsed/110) % 2 === 0;
-      if (flash) { fr(130,DOOR_Y,60,DOOR_H,'#55668a'); fr(130,DOOR_Y,28,DOOR_H,'#6677bb'); fr(160,DOOR_Y,30,DOOR_H,'#6677bb'); }
-      tx('문이 열립니다!', W/2, 30, 9, '#ffdd44', 'center');
-      // WARNING부터 걷기 시작 — 멈춤 없이 연속 진행
-      const wPos = walkPos(elapsed);
-      drawChar(wPos.bak, BAK_Y0, C_BAK, C_BAKL, '박씨');
-      drawChar(wPos.man, MAN_Y0, C_MAN, C_MANL, '아저씨');
+
+    if (state === S.COUNTDOWN || state === S.WARNING) {
+      drawDoor(0, 0);
+      if (state === S.COUNTDOWN) {
+        drawChar(BAK_X0, BAK_Y0, C_BAK, C_BAKL, '박씨');
+        drawChar(MAN_X0, MAN_Y0, C_MAN, C_MANL, '아저씨');
+      }
+      if (state === S.COUNTDOWN) {
+        const phase = Math.min(3, Math.floor(elapsed / (COUNTDOWN_MS/4)));
+        if (phase !== lastCountdownPhase) {
+          lastCountdownPhase = phase;
+          playDingDong(phase);
+        }
+        tx(['띵동...','다음 역은','홍대입구역','입니다.'][phase], W/2, 30, 9, '#cccc88', 'center');
+      } else {
+        const flash = Math.floor(elapsed/110) % 2 === 0;
+        if (flash) { fr(130,DOOR_Y,60,DOOR_H,'#55668a'); fr(130,DOOR_Y,28,DOOR_H,'#6677bb'); fr(160,DOOR_Y,30,DOOR_H,'#6677bb'); }
+        tx('문이 열립니다!', W/2, 30, 9, '#ffdd44', 'center');
+        // WARNING부터 걷기 시작 — 멈춤 없이 연속 진행
+        const wPos = walkPos(elapsed);
+        drawChar(wPos.bak, BAK_Y0, C_BAK, C_BAKL, '박씨');
+        drawChar(wPos.man, MAN_Y0, C_MAN, C_MANL, '아저씨');
+      }
+      if (state === S.COUNTDOWN && elapsed >= COUNTDOWN_MS) enter(S.WARNING);
+      if (state === S.WARNING   && elapsed >= WARNING_MS)   enter(S.DOOR_OPEN);
+      return;
     }
-    if (state === S.COUNTDOWN && elapsed >= COUNTDOWN_MS) enter(S.WARNING);
-    if (state === S.WARNING   && elapsed >= WARNING_MS)   enter(S.DOOR_OPEN);
-    return;
+
+    if (state === S.DOOR_OPEN) {
+      const de = now - doorOpenAt;
+      const doorT = Math.min(de / DOOR_ANIM_MS, 1);
+      drawDoor(doorT, doorT);
+
+      const pos = walkPos(WARNING_MS + de);  // WARNING부터 누적 걷기 시간
+      drawChar(pos.bak, BAK_Y0, C_BAK, C_BAKL, '박씨');
+      drawChar(pos.man, MAN_Y0, C_MAN, C_MANL, '아저씨');
+      if (!inputAt && de > MISS_TIMEOUT) {
+        walkElapsedAtResult = WARNING_MS + MISS_TIMEOUT;
+        grade = 'MISS'; success = false; enter(S.RESULT);
+      }
+      return;
+    }
+
+    if (state === S.RESULT) {
+      const t = elapsed;
+      const p = walkPos(walkElapsedAtResult);  // 입력 시점의 캐릭터 위치
+
+      if (success) {
+        // 1. 성공 시퀀스 (PERFECT, GOOD)
+        const rightT = Math.max(0, 1 - t / 200);
+        const leftT = t < 1200 ? 1 : Math.max(0, 1 - (t - 1200) / 600);
+        drawDoor(leftT, rightT);
+
+        if (t < 600) drawPsychic(DR_X + DR_W/2 + 8, DOOR_Y + 18, t / 600);
+
+        const manX = lerp(p.man, DR_X + 4, Math.min(t / 200, 1));
+        if (t >= 200) {
+          drawFallen(DR_X + 4, MAN_Y0 + 4, C_MAN, C_MANL, '아저씨', 1);
+          if (t >= 200 && t < 700) tx('쾅!', DR_X + DR_W/2, DOOR_Y - 6, 10, '#ffee44', 'center');
+        } else {
+          drawChar(manX, MAN_Y0, C_MAN, C_MANL, '아저씨');
+        }
+
+        if (t < 1300) {
+          if (t < 1200) {
+            const bakX = lerp(p.bak, SEAT_X - 4, easeOut(t / 1200));
+            drawChar(bakX, BAK_Y0, C_BAK, C_BAKL, '박씨');
+          } else {
+            drawChar(SEAT_X - 4, BAK_Y0, C_BAK, C_BAKL, '박씨');
+          }
+        }
+
+        _resultOverlay(t, 1500);
+
+      } else if (grade === 'BAD') {
+        // 2. 너무 일찍 클릭한 시퀀스 (BAD)
+        let rightT;
+        if (t < 250) {
+          rightT = Math.max(0, 1 - t / 250);
+        } else if (t < 750) {
+          rightT = 0;
+        } else if (t < 1200) {
+          rightT = Math.min(1, (t - 750) / 450);
+        } else if (t < 2400) {
+          rightT = 1;
+        } else {
+          rightT = Math.max(0, 1 - (t - 2400) / 600);
+        }
+
+        const leftT = t < 2400 ? 1 : Math.max(0, 1 - (t - 2400) / 600);
+        drawDoor(leftT, rightT);
+
+        if (t < 500) drawPsychic(DR_X + DR_W/2 + 8, DOOR_Y + 18, t / 500);
+
+        if (t < 2500) {
+          let manX;
+          if (t < 250) {
+            manX = lerp(p.man, DR_X + 8, t / 250);
+          } else if (t < 1200) {
+            manX = DR_X + 8;
+          } else if (t < 1800) {
+            manX = lerp(DR_X + 8, 125, (t - 1200) / 600);
+          } else if (t < 2400) {
+            manX = lerp(125, SEAT_X - 4, easeOut((t - 1800) / 600));
+          } else {
+            manX = SEAT_X - 4;
+          }
+          drawChar(manX, MAN_Y0, C_MAN, C_MANL, '아저씨');
+        }
+
+        if (t < 1800) {
+          const bakX = lerp(p.bak, 110, t / 1800);
+          drawChar(bakX, BAK_Y0, C_BAK, C_BAKL, '박씨');
+        } else {
+          drawFallen(110, BAK_Y0 + 4, C_BAK, C_BAKL, '박씨', -1);
+          if (t >= 1800 && t < 2250) tx('쿵!', 122, DOOR_Y - 2, 10, '#ff6644', 'center');
+        }
+
+        _resultOverlay(t, 2700);
+
+      } else {
+        // 3. 아무것도 안 하거나 너무 늦게 클릭한 시퀀스 (MISS, LATE)
+        const leftT = t < 1500 ? 1 : Math.max(0, 1 - (t - 1500) / 800);
+        const rightT = t < 1500 ? 1 : Math.max(0, 1 - (t - 1500) / 800);
+        drawDoor(leftT, rightT);
+
+        if (t < 1800) {
+          let manX;
+          if (t < 800) {
+            manX = lerp(p.man, 125, easeOut(t / 800));
+          } else if (t < 1500) {
+            manX = lerp(125, SEAT_X - 4, easeOut((t - 800) / 700));
+          } else {
+            manX = SEAT_X - 4;
+          }
+          drawChar(manX, MAN_Y0, C_MAN, C_MANL, '아저씨');
+        }
+
+        if (t < 800) {
+          const bakX = lerp(p.bak, 110, t / 800);
+          drawChar(bakX, BAK_Y0, C_BAK, C_BAKL, '박씨');
+        } else {
+          drawFallen(110, BAK_Y0 + 4, C_BAK, C_BAKL, '박씨', -1);
+          if (t >= 800 && t < 1250) tx('쿵!', 122, DOOR_Y - 2, 10, '#ff6644', 'center');
+        }
+
+        _resultOverlay(t, 2000);
+      }
+      return;
+    }
   }
 
-  if (state === S.DOOR_OPEN) {
-    const de = now - doorOpenAt;
-    const doorT = Math.min(de / DOOR_ANIM_MS, 1);
-    drawDoor(doorT, doorT);
-    const pos = walkPos(WARNING_MS + de);  // WARNING부터 누적 걷기 시간
-    drawChar(pos.bak, BAK_Y0, C_BAK, C_BAKL, '박씨');
-    drawChar(pos.man, MAN_Y0, C_MAN, C_MANL, '아저씨');
-    if (!inputAt && de > MISS_TIMEOUT) {
-      walkElapsedAtResult = WARNING_MS + MISS_TIMEOUT;
-      grade = 'MISS'; success = false; enter(S.RESULT);
+  // 3. 얌체 차량 끼어들기 차단 스테이지
+  if (currentStage === 2) {
+    if (state === S.BRIEFING) {
+      fr(30, 18, 260, 144, '#1a1a2a');
+      sk(30, 18, 260, 144, '#aa8833', 2);
+      tx('[ 의 뢰 서 ]', W/2, 40, 10, '#aa8833', 'center');
+      tx('의뢰인: 김대리 (32세)', 44, 60, 7, '#ccccaa');
+      tx('내  용: 도로 위 얌체 차량 차단 요망', 44, 74, 7, '#ccccaa');
+      tx('       얌체차가 합류하려는 그 순간', 44, 86, 7, '#ccccaa');
+      tx('       앞의 초록차에 염력 급정지', 44, 98, 7, '#ccccaa');
+      tx('보  수: 4,500원 (PERFECT +1,000)', 44, 114, 7, '#ccccaa');
+      tx('난이도: ⚡⚡ 정밀 타이밍', 44, 126, 7, '#ccccaa');
+      tx('기  술: 염력 브레이크 (초록차 클릭)', 44, 139, 7, '#88ccff');
+      tx('클릭으로 시작', W/2, 155, 7, '#666', 'center');
+      return;
     }
-    return;
-  }
 
-  if (state === S.RESULT) {
-    const t = elapsed;
-    const p = walkPos(walkElapsedAtResult);  // 입력 시점의 캐릭터 위치
+    if (state === S.COUNTDOWN || state === S.WARNING) {
+      drawRoad(now, 4);
 
-    if (success) {
-      const isPerfect = grade === 'PERFECT';
-      // 오른쪽 문: 빠르게 닫힘 (염력)
-      const closeSpeed = isPerfect ? 220 : 380;
-      const rightT = Math.max(0, 1 - t / closeSpeed);
-      drawDoor(1, rightT);
+      const cars = getStage2CarPositions(elapsed);
+      cars.forEach(car => {
+        drawVehicle(car.x, car.y, car.col, car.colL, car.label, car.angle, car.warningFlash);
+      });
 
-      // 염력 이펙트
-      if (t < 700) drawPsychic(DR_X + DR_W/2 + 8, DOOR_Y + 18, t / 700);
-
-      // 아저씨 반응: 계속 걸어오다 문에 맞음
-      const manApproachX = lerp(p.man, DR_X + 4, easeOut(Math.min(t / 500, 1)));
-      if (isPerfect && t > 420) {
-        // 넘어짐
-        drawFallen(manApproachX - 8, MAN_Y0 + 4, C_MAN, C_MANL, '아저씨', 1);
-        if (t > 450 && t < 900) tx('쾅!', DR_X + DR_W/2, DOOR_Y - 6, 10, '#ffee44', 'center');
+      if (state === S.COUNTDOWN) {
+        const phase = Math.min(3, Math.floor(elapsed / (COUNTDOWN_MS/4)));
+        if (phase !== lastCountdownPhase) {
+          lastCountdownPhase = phase;
+          playDingDong(phase);
+        }
+        tx(['띵동...','얌체 출몰','지역에 진입','합니다.'][phase], W/2, 30, 9, '#cccc88', 'center');
       } else {
-        // 걸어오다 멈추거나 흔들림 (GOOD)
-        const shake = (!isPerfect && t > 350 && t < 750) ? Math.sin(t / 40) * 3 : 0;
-        drawChar(manApproachX + shake, MAN_Y0, C_MAN, C_MANL, '아저씨');
+        tx('⚠️ 끼어들기 감지! ⚠️', W/2, 30, 9, '#ffdd44', 'center');
       }
 
-      // 박씨: 천천히 자리로
-      const bakDelay = 400;
-      const bakX = lerp(p.bak, SEAT_X - 4, easeOut(Math.max(0, t - bakDelay) / 1600));
-      drawChar(bakX, BAK_Y0, C_BAK, C_BAKL, '박씨');
-
-      _resultOverlay(t, isPerfect ? 600 : 700);
-
-    } else {
-      // BAD: 오른쪽 문이 잠깐 닫혔다가 열림 (눌렀으나 타이밍이 틀림)
-      // MISS: 문 그냥 열린 채로
-      if (grade === 'BAD') {
-        const rightT = t < 220 ? Math.max(0, 1 - t / 220) : Math.min(1, (t - 220) / 350);
-        drawDoor(1, rightT);
-      } else {
-        drawDoor(1, 1);
-      }
-
-      // 아저씨: 문을 통과해 박씨를 밀치며 전진
-      const manX = lerp(p.man, SEAT_X + CW/2, easeOut(Math.min(t / 900, 1)));
-      drawChar(manX, MAN_Y0, C_MAN, C_MANL, '아저씨');
-
-      // 박씨: 걷다가 밀려서 넘어짐
-      const PUSH_T = 520;
-      if (t < PUSH_T) {
-        const bakX = lerp(p.bak, p.bak + 18, easeOut(t / PUSH_T));
-        drawChar(bakX, BAK_Y0, C_BAK, C_BAKL, '박씨');
-      } else {
-        drawFallen(p.bak + 10, BAK_Y0 + 4, C_BAK, C_BAKL, '박씨', -1);
-        if (t > PUSH_T && t < PUSH_T + 350) tx('쿵!', p.bak + 22, DOOR_Y - 2, 10, '#ff6644', 'center');
-      }
-
-      _resultOverlay(t, 650);
+      if (state === S.COUNTDOWN && elapsed >= COUNTDOWN_MS) enter(S.WARNING);
+      if (state === S.WARNING   && elapsed >= WARNING_MS)   enter(S.DOOR_OPEN);
+      return;
     }
-    return;
+
+    if (state === S.DOOR_OPEN) {
+      drawRoad(now, 4);
+      const dePhase1 = now - phase1Start;
+
+      // 입력 윈도우 종료 → 자동 LATE (3번이 자리2 도착 시점)
+      if (!inputAt && dePhase1 > S2_INPUT_END_MS) {
+        walkElapsedAtResult = S2_INPUT_END_MS;
+        clickGreenY = 200 - S2_INPUT_END_MS * S2_GREEN_SPEED;
+        grade = 'LATE';
+        success = false;
+        stage2Phase = 2;
+        enter(S.RESULT);
+        return;
+      }
+
+      const cars = getStage2CarPositions(dePhase1);
+      cars.forEach(car => {
+        drawVehicle(car.x, car.y, car.col, car.colL, car.label, car.angle, car.warningFlash);
+      });
+
+      // 초록차 클릭 단서 — 입력 윈도우(3번 이동 구간) 동안만 표시
+      const green = cars.find(c => c.isTarget);
+      if (green && dePhase1 >= S2_INPUT_START_MS && dePhase1 <= S2_INPUT_END_MS) {
+        drawTargetHint(green.x, green.y, dePhase1);
+      }
+      return;
+    }
+
+    if (state === S.RESULT) {
+      const t = elapsed;
+      const roadSpeed = success ? Math.max(0, 4 - t * 0.006) : Math.max(0.5, 4 - t * 0.004);
+      drawRoad(now, roadSpeed);
+
+      const cars = getStage2CarPositions(walkElapsedAtResult, t);
+      const targetCar = cars.find(c => c.id === 'green');
+      const yamcheCar = cars.find(c => c.id === 'red');
+      const kimCar = cars.find(c => c.id === 'kim');
+
+      // 1. 스키드 마크 (성공/BAD: 초록차가 멈춘 자리 뒤로 50px 가량 검게)
+      if ((success || grade === 'BAD') && targetCar && targetCar.y < 200 && targetCar.y > -16) {
+        const fY = targetCar.y + 16;  // 차량 뒤축
+        const skidLen = Math.min(50, 200 - fY);
+        if (skidLen > 0) {
+          fr(184 + 2, fY, 2, skidLen, '#111');
+          fr(184 + 8, fY, 2, skidLen, '#111');
+        }
+      }
+
+      // 2. 차량들 렌더링
+      cars.forEach(car => {
+        drawVehicle(car.x, car.y, car.col, car.colL, car.label, car.angle, car.warningFlash);
+      });
+
+      // 3. 염력 격발 이펙트 (성공/BAD 시 앞차 위치에)
+      if (success && t < 600 && targetCar) {
+        drawPsychic(targetCar.x + 6, targetCar.y + 10, t / 600);
+      } else if (grade === 'BAD' && t < 500 && targetCar && targetCar.y < 200) {
+        drawPsychic(targetCar.x + 6, targetCar.y + 10, t / 500);
+      }
+
+      // 4. 효과 텍스트 및 사운드 오버레이
+      if (success) {
+        if (t >= 100 && t < 600 && targetCar) {
+          tx('끼익!', targetCar.x + 6, targetCar.y - 6, 9, '#ffee44', 'center');
+        }
+        if (t >= 800 && t < 1300 && yamcheCar) {
+          tx('빵빵!?', yamcheCar.x + 6, yamcheCar.y - 6, 8, '#ff9933', 'center');
+        }
+        _resultOverlay2(t, 1500);
+      } else if (grade === 'BAD') {
+        // 너무 일찍 — 얌체차가 눈치 채고 회피
+        if (t >= 200 && t < 800 && yamcheCar) {
+          tx('회피!', yamcheCar.x + 6, yamcheCar.y - 6, 9, '#ffee44', 'center');
+        }
+        if (t >= 900 && t < 1400 && kimCar) {
+          tx('빵빵!', kimCar.x + 6, kimCar.y - 6, 9, '#ff3333', 'center');
+        }
+        _resultOverlay2(t, 2200);
+      } else {
+        // LATE — 얌체차가 김대리에게 들이쳐 합류
+        if (t >= 0 && t < 500 && yamcheCar && kimCar) {
+          // 충격 셰이크: 김대리 차 잠깐 흔들림
+          const shake = Math.sin(t * 0.08) * 1.5;
+          ctx.save();
+          ctx.translate(shake, 0);
+          drawVehicle(kimCar.x, kimCar.y, kimCar.col, kimCar.colL, kimCar.label);
+          ctx.restore();
+          tx('충격!', kimCar.x + 6, kimCar.y - 6, 9, '#ff5533', 'center');
+        }
+        if (t >= 500 && t < 1000 && kimCar) {
+          tx('빵빵!', kimCar.x + 6, kimCar.y - 6, 9, '#ff3333', 'center');
+        }
+        _resultOverlay2(t, 1800);
+      }
+      return;
+    }
   }
 }
 
 function _resultOverlay(t, delay) {
   if (t < delay) return;
-  const colors = { PERFECT:'#ffee44', GOOD:'#88ff88', BAD:'#ff7733', MISS:'#cc4444' };
-  tx(grade, W/2, 52, 16, colors[grade], 'center');
+  const colors = { PERFECT:'#ffee44', GOOD:'#88ff88', BAD:'#ff7733', LATE:'#ff3333', MISS:'#cc4444' };
+  tx(grade, W/2, 52, 16, colors[grade] || '#ffffff', 'center');
   tx(
     success ? '성공!  +3,500원' : '실패...  위약금 -500원',
     W/2, 158, 8,
     success ? '#88ff88' : '#ff6655',
     'center'
   );
+}
+
+function _resultOverlay2(t, delay) {
+  if (t < delay) return;
+  const colors = { PERFECT:'#ffee44', GOOD:'#88ff88', BAD:'#ff7733', LATE:'#ff3333', MISS:'#cc4444' };
+  tx(grade, W/2, 52, 16, colors[grade] || '#ffffff', 'center');
+  const reward = grade === 'PERFECT' ? `성공!  +${(4500+PERFECT_BONUS).toLocaleString()}원 (정밀 보너스!)`
+              : success ? '성공!  +4,500원'
+              : '실패...  위약금 -500원';
+  tx(reward, W/2, 158, 8, success ? '#88ff88' : '#ff6655', 'center');
 }
 
 requestAnimationFrame(loop);
